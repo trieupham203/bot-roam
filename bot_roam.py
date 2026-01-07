@@ -1,4 +1,7 @@
+import json
+import os
 import time
+import random
 import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -24,9 +27,9 @@ ROAM_BSC_DECIMALS = 6
 RPC_BSC = "https://bsc-dataseed.binance.org/"
 
 # Runtime
-POLL_INTERVAL_SEC = 5
-ALERT_THRESHOLD = Decimal("1")   # chỉ báo nếu |delta| >= 1 ROAM
-SEND_STARTUP_MESSAGE = True
+POLL_INTERVAL_SEC = 8                      # bạn có thể tăng 10-20s để giảm 429
+ALERT_THRESHOLD = Decimal("1")             # chỉ báo nếu |amount| >= 1 ROAM
+STATE_FILE = "roam_state.json"             # lưu state chống spam khi restart
 
 # ==========================================================
 # LOGGING
@@ -35,7 +38,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ROAM_WATCHDOG")
+log = logging.getLogger("ROAM_TX_ONLY")
 
 
 # ==========================================================
@@ -45,7 +48,6 @@ SEP = "──────────────"
 
 
 def now_str() -> str:
-    # dd/mm/YYYY HH:MM:SS
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
@@ -59,10 +61,6 @@ def to_decimal(x) -> Optional[Decimal]:
 
 
 def fmt_int_trunc(x: Decimal) -> str:
-    """
-    Cắt phần thập phân (truncate) - ROUND_DOWN cắt về phía 0.
-    12.99 -> 12 ; -12.99 -> -12
-    """
     n = x.quantize(Decimal("1"), rounding=ROUND_DOWN)
     return f"{n:,}"
 
@@ -73,9 +71,62 @@ def keccak_topic_transfer() -> str:
 
 
 def pad_address_topic(addr: str) -> str:
-    # 32 bytes topic: 0x + 24 bytes 0 + 20 bytes address
     a = addr.lower().replace("0x", "")
-    return "0x" + ("0" * 48) + a  # 48 hex = 24 bytes
+    return "0x" + ("0" * 48) + a
+
+
+def atomic_write_json(path: str, data: dict) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ==========================================================
+# STATE
+# ==========================================================
+class StateStore:
+    def __init__(self, path: str):
+        self.path = path
+        self.data = {
+            "sol_last_sig": None,
+            "bsc_last_block": None,
+        }
+        self.load()
+
+    def load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                self.data.update(obj)
+        except Exception as e:
+            log.warning("Không đọc được state file (%s): %s", self.path, e)
+
+    def save(self) -> None:
+        try:
+            atomic_write_json(self.path, self.data)
+        except Exception as e:
+            log.warning("Không lưu được state file (%s): %s", self.path, e)
+
+    @property
+    def sol_last_sig(self) -> Optional[str]:
+        return self.data.get("sol_last_sig")
+
+    @sol_last_sig.setter
+    def sol_last_sig(self, v: Optional[str]) -> None:
+        self.data["sol_last_sig"] = v
+
+    @property
+    def bsc_last_block(self) -> Optional[int]:
+        v = self.data.get("bsc_last_block")
+        return int(v) if v is not None else None
+
+    @bsc_last_block.setter
+    def bsc_last_block(self, v: Optional[int]) -> None:
+        self.data["bsc_last_block"] = v
 
 
 # ==========================================================
@@ -94,7 +145,7 @@ class TelegramClient:
             "disable_web_page_preview": True,
         }
         try:
-            r = self.session.post(self.url, json=payload, timeout=10)
+            r = self.session.post(self.url, json=payload, timeout=12)
             if r.status_code != 200:
                 log.error("Telegram lỗi %s: %s", r.status_code, r.text[:500])
             else:
@@ -103,88 +154,143 @@ class TelegramClient:
             log.error("Lỗi mạng Telegram: %s", e)
 
 
+def msg_tx(chain: str, direction: str, amount: Decimal, balance: Optional[Decimal], tx_url: str) -> str:
+    # direction: IN / OUT
+    is_in = (direction == "IN")
+    sign = "+" if is_in else "-"
+    arrow = "⬆️" if is_in else "⬇️"
+
+    bal_line = ""
+    if balance is not None:
+        bal_line = f"\nBalance: <b>{fmt_int_trunc(balance)}</b> ROAM"
+
+    return (
+        "🔔 <b>ROAM ALERT</b>\n"
+        f"{SEP}\n"
+        f"Network: <b>{chain}</b>\n"
+        f"{arrow} {('NẠP' if is_in else 'RÚT')}\n"
+        f"Amount: <b>{sign}{fmt_int_trunc(amount.copy_abs())}</b> ROAM"
+        f"{bal_line}\n"
+        f"{SEP}\n"
+        f"🕒 <code>{now_str()}</code>\n"
+        f"🔗 <a href=\"{tx_url}\">Transaction</a>"
+    )
+
+
 # ==========================================================
-# SOLANA
+# RPC HELPERS (BACKOFF)
+# ==========================================================
+def post_json_with_backoff(
+    session: requests.Session,
+    url: str,
+    payload: dict,
+    headers: Optional[dict] = None,
+    timeout: int = 10,
+    max_backoff: int = 60,
+) -> Optional[dict]:
+    backoff = 2
+    while True:
+        try:
+            r = session.post(url, json=payload, headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                sleep_s = min(backoff, max_backoff) + random.uniform(0, 1.2)
+                log.warning("RPC 429 (%s) — sleep %.1fs", url, sleep_s)
+                time.sleep(sleep_s)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            sleep_s = min(backoff, max_backoff) + random.uniform(0, 1.2)
+            log.warning("RPC lỗi (%s): %s — sleep %.1fs", url, e, sleep_s)
+            time.sleep(sleep_s)
+            backoff = min(backoff * 2, max_backoff)
+        except ValueError:
+            log.warning("RPC trả JSON lỗi (%s)", url)
+            return None
+
+
+# ==========================================================
+# SOLANA (CHỈ NHẮN KHI CÓ SIGNATURE MỚI)
 # ==========================================================
 class SolanaReader:
     def __init__(self, session: requests.Session):
         self.session = session
 
-    def get_roam_balance(self) -> Optional[Decimal]:
-        """
-        Tổng ROAM trên SOL (cộng dồn tất cả token accounts theo mint).
-        """
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                WALLET_SOL,
-                {"mint": CONTRACT_ROAM_SOL},
-                {"encoding": "jsonParsed"},
-            ],
-        }
-        try:
-            r = self.session.post(
-                RPC_SOL,
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=8,
-            )
-            r.raise_for_status()
-            data = r.json()
-
-            value = (data.get("result") or {}).get("value") or []
-            total = Decimal("0")
-
-            for item in value:
-                ui_amount = (
-                    item.get("account", {})
-                    .get("data", {})
-                    .get("parsed", {})
-                    .get("info", {})
-                    .get("tokenAmount", {})
-                    .get("uiAmount")
-                )
-                d = to_decimal(ui_amount)
-                if d is not None:
-                    total += d
-
-            return total
-        except (requests.RequestException, ValueError) as e:
-            log.warning("SOL RPC lỗi: %s", e)
-            return None
-
-    def get_latest_tx_signature(self) -> Optional[str]:
-        """
-        Lấy signature mới nhất của address (để gắn link check transaction).
-        """
+    def get_signatures(self, limit: int = 10) -> List[dict]:
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [WALLET_SOL, {"limit": 1}],
+            "params": [WALLET_SOL, {"limit": limit}],
         }
+        data = post_json_with_backoff(
+            self.session,
+            RPC_SOL,
+            payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return (data or {}).get("result") or []
+
+    def get_transaction(self, signature: str) -> Optional[dict]:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        }
+        return post_json_with_backoff(
+            self.session,
+            RPC_SOL,
+            payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+
+    def parse_roam_delta_and_balance(self, tx: dict) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """
+        Trả về (delta, new_balance) dựa trên preTokenBalances/postTokenBalances
+        cho đúng mint ROAM + đúng owner WALLET_SOL.
+        """
         try:
-            r = self.session.post(
-                RPC_SOL,
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=8,
-            )
-            r.raise_for_status()
-            data = r.json()
-            res = data.get("result") or []
-            if not res:
-                return None
-            return res[0].get("signature")
-        except (requests.RequestException, ValueError) as e:
-            log.warning("SOL getSignatures lỗi: %s", e)
-            return None
+            result = tx.get("result") or {}
+            meta = result.get("meta") or {}
+            pre = meta.get("preTokenBalances") or []
+            post = meta.get("postTokenBalances") or []
+
+            def sum_for(arr: list) -> Decimal:
+                total = Decimal("0")
+                for it in arr:
+                    if it.get("mint") != CONTRACT_ROAM_SOL:
+                        continue
+                    if it.get("owner") != WALLET_SOL:
+                        continue
+                    ui = (((it.get("uiTokenAmount") or {}).get("uiAmount")))
+                    d = to_decimal(ui)
+                    if d is not None:
+                        total += d
+                return total
+
+            pre_total = sum_for(pre)
+            post_total = sum_for(post)
+
+            delta = post_total - pre_total
+            # Nếu tx không chạm ROAM mint/owner -> delta = 0
+            return delta, post_total
+        except Exception:
+            return None, None
 
 
 # ==========================================================
-# BSC
+# BSC (CHỈ NHẮN KHI CÓ LOG MỚI)
 # ==========================================================
 class BscReader:
     def __init__(self, session: requests.Session):
@@ -192,27 +298,20 @@ class BscReader:
 
     def rpc(self, method: str, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        r = self.session.post(RPC_BSC, json=payload, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        return post_json_with_backoff(self.session, RPC_BSC, payload, timeout=12)
 
     def get_latest_block(self) -> Optional[int]:
         try:
             data = self.rpc("eth_blockNumber", [])
+            if not data or "result" not in data:
+                return None
             return int(data["result"], 16)
         except Exception as e:
             log.warning("BSC blockNumber lỗi: %s", e)
             return None
 
     def get_roam_balance(self) -> Optional[Decimal]:
-        """
-        balanceOf(wallet) qua eth_call
-        """
         try:
-            if not (WALLET_BSC.startswith("0x") and len(WALLET_BSC) == 42):
-                log.error("WALLET_BSC không hợp lệ: %s", WALLET_BSC)
-                return None
-
             wallet_padded = WALLET_BSC[2:].lower().zfill(64)
             data_param = "0x70a08231" + wallet_padded  # balanceOf
 
@@ -223,35 +322,25 @@ class BscReader:
                 "params": [{"to": CONTRACT_ROAM_BSC, "data": data_param}, "latest"],
             }
 
-            r = self.session.post(RPC_BSC, json=payload, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-
-            result = data.get("result")
-            if not result or result == "0x":
+            data = post_json_with_backoff(self.session, RPC_BSC, payload, timeout=12)
+            if not data or not data.get("result") or data["result"] == "0x":
                 return Decimal("0")
 
-            raw = int(result, 16)
+            raw = int(data["result"], 16)
             return Decimal(raw) / (Decimal(10) ** ROAM_BSC_DECIMALS)
-
         except Exception as e:
             log.warning("BSC balance lỗi: %s", e)
             return None
 
 
 class BscTransferWatcher:
-    """
-    Quét Transfer logs của token contract để lấy tx hash (IN/OUT) liên tục.
-    """
-    def __init__(self, bsc: BscReader):
+    def __init__(self, bsc: BscReader, start_block: Optional[int]):
         self.bsc = bsc
-        self.last_block: Optional[int] = None
+        self.last_block: Optional[int] = start_block
         self.topic0 = keccak_topic_transfer()
         self.wallet_topic = pad_address_topic(WALLET_BSC)
 
     def _get_logs(self, from_block: int, to_block: int, direction: str) -> List[dict]:
-        # IN  -> topic2 = wallet
-        # OUT -> topic1 = wallet
         if direction == "IN":
             topics = [self.topic0, None, self.wallet_topic]
         else:
@@ -265,20 +354,20 @@ class BscTransferWatcher:
         }]
 
         data = self.bsc.rpc("eth_getLogs", params)
-        return data.get("result") or []
+        return (data or {}).get("result") or []
 
-    def poll(self) -> List[Dict]:
+    def poll(self) -> Tuple[List[Dict], Optional[int]]:
         latest = self.bsc.get_latest_block()
         if latest is None:
-            return []
+            return [], self.last_block
 
-        # Lần đầu: set mốc block hiện tại để không spam lịch sử
+        # Nếu chưa có mốc: set mốc hiện tại (không gửi lịch sử)
         if self.last_block is None:
             self.last_block = latest
-            return []
+            return [], self.last_block
 
         if latest <= self.last_block:
-            return []
+            return [], self.last_block
 
         from_block = self.last_block + 1
         to_block = latest
@@ -293,7 +382,6 @@ class BscTransferWatcher:
 
         self.last_block = latest
 
-        # Parse + sort
         seen: set[Tuple[str, int]] = set()
         parsed: List[Dict] = []
 
@@ -323,105 +411,124 @@ class BscTransferWatcher:
         parse_logs(logs_out, "OUT")
 
         parsed.sort(key=lambda x: (x["block"], x["logIndex"]))
-        return parsed
+        return parsed, self.last_block
 
 
 # ==========================================================
-# MESSAGE UI (DỄ NHÌN – RÕ RÀNG – ICON ĐƠN GIẢN)
-# ==========================================================
-def msg_startup(sol_bal: Decimal, bsc_bal: Decimal) -> str:
-    return (
-        "✅ <b>ROAM WATCH</b>\n"
-        f"{SEP}\n"
-        f"<b>SOL</b>: <b>{fmt_int_trunc(sol_bal)}</b> ROAM\n"
-        f"<b>BSC</b>: <b>{fmt_int_trunc(bsc_bal)}</b> ROAM\n"
-        f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>"
-    )
-
-
-def msg_sol_change(delta: Decimal, new_bal: Decimal, tx_sig: Optional[str]) -> str:
-    is_in = delta > 0
-    t = "NẠP" if is_in else "RÚT"
-    sign = "+" if is_in else "-"
-    amt = delta.copy_abs()
-
-    tx_line = f"\n🔗 <a href='https://solscan.io/tx/{tx_sig}'>Check transaction</a>" if tx_sig else ""
-
-    return (
-        "🔔 <b>ROAM UPDATE</b>\n"
-        "<b>Network</b>: SOL\n"
-        f"{SEP}\n"
-        f"<b>Type</b>: {t}\n"
-        f"<b>Amount</b>: <b>{sign}{fmt_int_trunc(amt)}</b> ROAM\n"
-        f"<b>Balance</b>: <b>{fmt_int_trunc(new_bal)}</b> ROAM\n"
-        f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>"
-        f"{tx_line}"
-    )
-
-
-def msg_bsc_transfer(direction: str, amount: Decimal, new_bal: Decimal, tx_hash: str) -> str:
-    is_in = (direction == "IN")
-    t = "NẠP" if is_in else "RÚT"
-    sign = "+" if is_in else "-"
-
-    return (
-        "🔔 <b>ROAM UPDATE</b>\n"
-        "<b>Network</b>: BSC\n"
-        f"{SEP}\n"
-        f"<b>Type</b>: {t}\n"
-        f"<b>Amount</b>: <b>{sign}{fmt_int_trunc(amount)}</b> ROAM\n"
-        f"<b>Balance</b>: <b>{fmt_int_trunc(new_bal)}</b> ROAM\n"
-        f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>\n"
-        f"🔗 <a href='https://bscscan.com/tx/{tx_hash}'>Check transaction</a>"
-    )
-
-
-# ==========================================================
-# MAIN
+# MAIN (CHỈ GỬI KHI CÓ TX MỚI)
 # ==========================================================
 def main():
+    state = StateStore(STATE_FILE)
+
     with requests.Session() as session:
         tele = TelegramClient(session)
-
         sol = SolanaReader(session)
         bsc = BscReader(session)
-        bsc_watch = BscTransferWatcher(bsc)
 
-        log.info("🔄 Lấy dữ liệu lần đầu...")
-        last_sol = sol.get_roam_balance() or Decimal("0")
-        last_bsc = bsc.get_roam_balance() or Decimal("0")
+        # Khởi tạo BSC watcher từ state (nếu có), nếu không có thì để None -> set mốc theo latest và không gửi lịch sử
+        bsc_watch = BscTransferWatcher(bsc, start_block=state.bsc_last_block)
 
-        log.info("✅ OK | SOL=%s | BSC=%s", fmt_int_trunc(last_sol), fmt_int_trunc(last_bsc))
+        # SOL: nếu chưa có last_sig -> set baseline = sig mới nhất (không gửi)
+        if not state.sol_last_sig:
+            sigs = sol.get_signatures(limit=1)
+            if sigs:
+                state.sol_last_sig = sigs[0].get("signature")
+                state.save()
+                log.info("SOL baseline set: %s", state.sol_last_sig)
 
-        if SEND_STARTUP_MESSAGE:
-            tele.send_html(msg_startup(last_sol, last_bsc))
+        # BSC: nếu chưa có last_block -> poll 1 lần để set baseline
+        if state.bsc_last_block is None:
+            _, lastb = bsc_watch.poll()
+            state.bsc_last_block = lastb
+            state.save()
+            log.info("BSC baseline set: %s", state.bsc_last_block)
 
-        log.info("🛡️ Canh gác liên tục... (%ss/lần)", POLL_INTERVAL_SEC)
+        log.info("🛡️ Running (TX-only). Interval=%ss", POLL_INTERVAL_SEC)
 
         while True:
             try:
-                # SOL: báo khi balance đổi + kèm link tx mới nhất
-                curr_sol = sol.get_roam_balance()
-                if curr_sol is not None:
-                    delta = curr_sol - last_sol
-                    if delta.copy_abs() >= ALERT_THRESHOLD:
-                        sig = sol.get_latest_tx_signature()
-                        tele.send_html(msg_sol_change(delta, curr_sol, sig))
-                        last_sol = curr_sol
+                # --------------------------
+                # SOL: xử lý signature mới
+                # --------------------------
+                try:
+                    sigs = sol.get_signatures(limit=15)
+                    if sigs:
+                        newest_sig = sigs[0].get("signature")
 
-                # BSC: quét Transfer logs lấy tx thật sự (IN/OUT)
-                transfers = bsc_watch.poll()
+                        if state.sol_last_sig and newest_sig != state.sol_last_sig:
+                            # Lấy các sig mới (từ newest về đến trước last_sig), rồi đảo để xử lý từ cũ -> mới
+                            new_list = []
+                            for it in sigs:
+                                s = it.get("signature")
+                                if not s:
+                                    continue
+                                if s == state.sol_last_sig:
+                                    break
+                                new_list.append(s)
+
+                            for sig in reversed(new_list):
+                                tx = sol.get_transaction(sig)
+                                if not tx:
+                                    continue
+
+                                delta, new_bal = sol.parse_roam_delta_and_balance(tx)
+                                if delta is None:
+                                    continue
+
+                                # Nếu tx không liên quan ROAM -> bỏ qua, nhưng vẫn update last_sig để không nhắn lại
+                                if delta.copy_abs() < ALERT_THRESHOLD:
+                                    state.sol_last_sig = sig
+                                    state.save()
+                                    continue
+
+                                direction = "IN" if delta > 0 else "OUT"
+                                tele.send_html(
+                                    msg_tx(
+                                        chain="SOL",
+                                        direction=direction,
+                                        amount=delta.copy_abs(),
+                                        balance=new_bal,
+                                        tx_url=f"https://solscan.io/tx/{sig}",
+                                    )
+                                )
+
+                                state.sol_last_sig = sig
+                                state.save()
+
+                        # Nếu state rỗng hoặc chưa cập nhật, giữ cho chắc
+                        if not state.sol_last_sig and newest_sig:
+                            state.sol_last_sig = newest_sig
+                            state.save()
+
+                except Exception as e:
+                    log.warning("SOL loop lỗi: %s", e)
+
+                # --------------------------
+                # BSC: xử lý logs mới
+                # --------------------------
+                transfers, last_block = bsc_watch.poll()
+                if last_block is not None and last_block != state.bsc_last_block:
+                    state.bsc_last_block = last_block
+                    state.save()
+
                 if transfers:
-                    curr_bsc = bsc.get_roam_balance() or last_bsc
+                    # chỉ khi có transfer mới gọi balance (đỡ tốn)
+                    curr_bsc_bal = bsc.get_roam_balance()
                     for t in transfers:
-                        amt = t["amount"].copy_abs()
-                        if amt < ALERT_THRESHOLD:
+                        amt = t["amount"]
+                        if amt.copy_abs() < ALERT_THRESHOLD:
                             continue
-                        tele.send_html(msg_bsc_transfer(t["direction"], amt, curr_bsc, t["tx"]))
-                    last_bsc = curr_bsc
+
+                        direction = t["direction"]
+                        tele.send_html(
+                            msg_tx(
+                                chain="BSC",
+                                direction=direction,
+                                amount=amt.copy_abs(),
+                                balance=curr_bsc_bal,
+                                tx_url=f"https://bscscan.com/tx/{t['tx']}",
+                            )
+                        )
 
                 time.sleep(POLL_INTERVAL_SEC)
 
@@ -429,7 +536,7 @@ def main():
                 log.info("⛔ Stopped by user.")
                 break
             except Exception as e:
-                log.exception("Lỗi vòng lặp: %s", e)
+                log.exception("Main loop lỗi: %s", e)
                 time.sleep(POLL_INTERVAL_SEC)
 
 
