@@ -15,14 +15,13 @@ from flask import Flask
 TELEGRAM_BOT_TOKEN = "8285842393:AAHIADmQQ0vYMmIOZp8lD-kdEID0bfDKIxU"
 TELEGRAM_CHAT_ID = "@roamliquidity"
 
-# SOLANA (ROAM) - Dùng RPC có rate limit cao hơn
+# SOLANA (ROAM)
 WALLET_SOL = "DSjPt6AtYu7NvKvVzxPkL2BMxrA3M4zK9jQaN1yunktg"
 CONTRACT_ROAM_SOL = "RoamA1USA8xjvpTJZ6RvvxyDRzNh6GCA1zVGKSiMVkn"
-# Thử các RPC này theo thứ tự
 RPC_SOL_LIST = [
-    "https://solana-mainnet.g.alchemy.com/v2/demo",
     "https://api.mainnet-beta.solana.com",
     "https://solana-api.projectserum.com",
+    "https://solana-mainnet.g.alchemy.com/v2/demo",
 ]
 
 # BSC (ROAM)
@@ -32,12 +31,11 @@ ROAM_BSC_DECIMALS = 6
 RPC_BSC = "https://bsc-dataseed.binance.org/"
 
 # Runtime
-POLL_INTERVAL_SEC = 10  # Tăng lên 10s để tránh rate limit
-SOL_POLL_INTERVAL_SEC = 15  # SOL poll chậm hơn vì dễ bị rate limit
+POLL_INTERVAL_SEC = 10
+SOL_POLL_INTERVAL_SEC = 20  # Check SOL mỗi 20s
 ALERT_THRESHOLD = Decimal("1")
 SEND_STARTUP_MESSAGE = True
 
-# Render port
 PORT = int(os.environ.get("PORT", 10000))
 
 # ==========================================================
@@ -108,7 +106,7 @@ class TelegramClient:
 
 
 # ==========================================================
-# SOLANA - With fallback RPCs
+# SOLANA
 # ==========================================================
 class SolanaReader:
     def __init__(self, session: requests.Session):
@@ -123,7 +121,7 @@ class SolanaReader:
         self.current_rpc_idx = (self.current_rpc_idx + 1) % len(RPC_SOL_LIST)
         log.info("🔄 Chuyển sang RPC: %s", self._get_current_rpc())
 
-    def _rpc_call(self, payload: dict, timeout: int = 10):
+    def _rpc_call(self, payload: dict, timeout: int = 15):
         max_attempts = len(RPC_SOL_LIST)
         for attempt in range(max_attempts):
             try:
@@ -136,9 +134,9 @@ class SolanaReader:
                 )
                 
                 if r.status_code == 429:
-                    log.warning("RPC %s bị rate limit, thử RPC khác...", rpc)
+                    log.warning("⚠️ RPC %s bị rate limit, thử RPC khác...", rpc)
                     self._switch_rpc()
-                    time.sleep(2)
+                    time.sleep(3)
                     continue
                     
                 r.raise_for_status()
@@ -146,11 +144,13 @@ class SolanaReader:
                 return r.json()
                 
             except requests.RequestException as e:
-                log.warning("SOL RPC lỗi (attempt %d/%d): %s", attempt + 1, max_attempts, e)
-                self._switch_rpc()
-                time.sleep(2)
+                log.warning("⚠️ SOL RPC lỗi (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                if attempt < max_attempts - 1:
+                    self._switch_rpc()
+                    time.sleep(2)
                 
         self.fail_count += 1
+        log.error("❌ Tất cả SOL RPC đều thất bại")
         return None
 
     def get_roam_balance(self) -> Optional[Decimal]:
@@ -186,6 +186,7 @@ class SolanaReader:
                 if d is not None:
                     total += d
 
+            log.debug("SOL balance: %s", total)
             return total
         except (ValueError, KeyError) as e:
             log.warning("Parse SOL balance lỗi: %s", e)
@@ -259,7 +260,9 @@ class BscReader:
                 return Decimal("0")
 
             raw = int(result, 16)
-            return Decimal(raw) / (Decimal(10) ** ROAM_BSC_DECIMALS)
+            balance = Decimal(raw) / (Decimal(10) ** ROAM_BSC_DECIMALS)
+            log.debug("BSC balance: %s", balance)
+            return balance
 
         except Exception as e:
             log.warning("BSC balance lỗi: %s", e)
@@ -296,6 +299,7 @@ class BscTransferWatcher:
 
         if self.last_block is None:
             self.last_block = latest
+            log.info("📍 BSC starting from block: %d", latest)
             return []
 
         if latest <= self.last_block:
@@ -304,11 +308,16 @@ class BscTransferWatcher:
         from_block = self.last_block + 1
         to_block = latest
 
+        log.debug("🔍 Scanning BSC blocks %d -> %d", from_block, to_block)
+
         logs_in: List[dict] = []
         logs_out: List[dict] = []
         try:
             logs_in = self._get_logs(from_block, to_block, "IN")
             logs_out = self._get_logs(from_block, to_block, "OUT")
+            
+            if logs_in or logs_out:
+                log.info("📥 Found %d IN, %d OUT logs", len(logs_in), len(logs_out))
         except Exception as e:
             log.warning("BSC getLogs lỗi: %s", e)
 
@@ -351,12 +360,12 @@ class BscTransferWatcher:
 # ==========================================================
 def msg_startup(sol_bal: Decimal, bsc_bal: Decimal) -> str:
     return (
-        "✅ <b>ROAM WATCH</b>\n"
+        "✅ <b>ROAM WATCH STARTED</b>\n"
         f"{SEP}\n"
         f"<b>SOL</b>: <b>{fmt_int_trunc(sol_bal)}</b> ROAM\n"
         f"<b>BSC</b>: <b>{fmt_int_trunc(bsc_bal)}</b> ROAM\n"
         f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>"
+        f"🕐 <code>{now_str()}</code>"
     )
 
 
@@ -376,7 +385,7 @@ def msg_sol_change(delta: Decimal, new_bal: Decimal, tx_sig: Optional[str]) -> s
         f"<b>Amount</b>: <b>{sign}{fmt_int_trunc(amt)}</b> ROAM\n"
         f"<b>Balance</b>: <b>{fmt_int_trunc(new_bal)}</b> ROAM\n"
         f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>"
+        f"🕐 <code>{now_str()}</code>"
         f"{tx_line}"
     )
 
@@ -394,13 +403,13 @@ def msg_bsc_transfer(direction: str, amount: Decimal, new_bal: Decimal, tx_hash:
         f"<b>Amount</b>: <b>{sign}{fmt_int_trunc(amount)}</b> ROAM\n"
         f"<b>Balance</b>: <b>{fmt_int_trunc(new_bal)}</b> ROAM\n"
         f"{SEP}\n"
-        f"🕒 <code>{now_str()}</code>\n"
+        f"🕐 <code>{now_str()}</code>\n"
         f"🔗 <a href='https://bscscan.com/tx/{tx_hash}'>Check transaction</a>"
     )
 
 
 # ==========================================================
-# FLASK APP (để Render không kill process)
+# FLASK APP
 # ==========================================================
 app = Flask(__name__)
 
@@ -433,30 +442,43 @@ def run_watchdog():
             tele.send_html(msg_startup(last_sol, last_bsc))
 
         log.info("🛡️ Canh gác liên tục...")
+        log.info("⏱️ SOL check every %ds | BSC check every %ds", SOL_POLL_INTERVAL_SEC, POLL_INTERVAL_SEC)
 
-        sol_counter = 0
+        last_sol_check = time.time()
 
         while True:
             try:
-                # SOL: poll chậm hơn để tránh rate limit
-                sol_counter += 1
-                if sol_counter * POLL_INTERVAL_SEC >= SOL_POLL_INTERVAL_SEC:
-                    sol_counter = 0
+                current_time = time.time()
+                
+                # SOL: Check theo thời gian thực tế
+                if current_time - last_sol_check >= SOL_POLL_INTERVAL_SEC:
+                    log.debug("🔍 Checking SOL balance...")
                     curr_sol = sol.get_roam_balance()
                     if curr_sol is not None:
                         delta = curr_sol - last_sol
+                        log.debug("SOL delta: %s (threshold: %s)", delta, ALERT_THRESHOLD)
+                        
                         if delta.copy_abs() >= ALERT_THRESHOLD:
+                            log.info("🚨 SOL change detected: %s", delta)
                             sig = sol.get_latest_tx_signature()
                             tele.send_html(msg_sol_change(delta, curr_sol, sig))
                             last_sol = curr_sol
+                        else:
+                            # Cập nhật last_sol ngay cả khi không có thay đổi lớn
+                            last_sol = curr_sol
+                    
+                    last_sol_check = current_time
 
-                # BSC: quét thường xuyên hơn
+                # BSC: Check mỗi POLL_INTERVAL_SEC
+                log.debug("🔍 Checking BSC transfers...")
                 transfers = bsc_watch.poll()
                 if transfers:
+                    log.info("🚨 BSC transfers detected: %d", len(transfers))
                     curr_bsc = bsc.get_roam_balance() or last_bsc
                     for t in transfers:
                         amt = t["amount"].copy_abs()
                         if amt < ALERT_THRESHOLD:
+                            log.debug("Skipping small transfer: %s", amt)
                             continue
                         tele.send_html(msg_bsc_transfer(t["direction"], amt, curr_bsc, t["tx"]))
                     last_bsc = curr_bsc
@@ -467,7 +489,7 @@ def run_watchdog():
                 log.info("⛔ Stopped by user.")
                 break
             except Exception as e:
-                log.exception("Lỗi vòng lặp: %s", e)
+                log.exception("❌ Lỗi vòng lặp: %s", e)
                 time.sleep(POLL_INTERVAL_SEC)
 
 
