@@ -421,7 +421,7 @@ def msg_sol_change(delta: Decimal, new_bal: Decimal, tx_sig: Optional[str]) -> s
     amt = delta.copy_abs()
     tx_line = f"\n🔗 <a href='https://solscan.io/tx/{tx_sig}'>View TX</a>" if tx_sig else ""
     return (
-        "🔔 <b>ROAM ALERT</b>\n"
+        "🔔 <b>ROAM UPDATE BALANCE</b>\n"
         "<b>Network</b>: SOL\n"
         f"{SEP}\n"
         f"<b>Type</b>: {t}\n"
@@ -437,7 +437,7 @@ def msg_bsc_transfer(direction: str, amount: Decimal, new_bal: Decimal, tx_hash:
     t = "NẠP" if is_in else "RÚT"
     sign = "+" if is_in else "-"
     return (
-        "🔔 <b>ROAM ALERT</b>\n"
+        "🔔 <b>ROAM UPDATE BALANCE</b>\n"
         "<b>Network</b>: BSC\n"
         f"{SEP}\n"
         f"<b>Type</b>: {t}\n"
@@ -619,3 +619,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
