@@ -66,6 +66,7 @@ last_activity = {"time": datetime.now(), "type": "startup"}
 SEP = "──────────────"
 
 def now_str() -> str:
+    """Trả về thời gian hiện tại"""
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 def to_decimal(x) -> Optional[Decimal]:
@@ -410,8 +411,7 @@ def msg_startup(sol_bal: Decimal, bsc_bal: Decimal) -> str:
         f"<b>SOL</b>: <b>{fmt_int_trunc(sol_bal)}</b> ROAM\n"
         f"<b>BSC</b>: <b>{fmt_int_trunc(bsc_bal)}</b> ROAM\n"
         f"{SEP}\n"
-        f"🕐 <code>{now_str()}</code>\n"
-        f"⏱️ Poll: SOL={SOL_POLL_INTERVAL_SEC}s, BSC={POLL_INTERVAL_SEC}s"
+        f"🕐 <code>{now_str()}</code>"
     )
 
 def msg_sol_change(delta: Decimal, new_bal: Decimal, tx_sig: Optional[str]) -> str:
