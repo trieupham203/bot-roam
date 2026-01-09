@@ -3,10 +3,9 @@ import logging
 import os
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from threading import Thread, Event
 import signal
-import sys
 
 import requests
 from flask import Flask
@@ -42,8 +41,10 @@ SOL_POLL_INTERVAL_SEC = 30
 ALERT_THRESHOLD = Decimal("1")
 SEND_STARTUP_MESSAGE = True
 HEARTBEAT_INTERVAL_SEC = 300
+SELF_PING_INTERVAL_SEC = 240  # Ping mỗi 4 phút để giữ Render service active
 
 PORT = int(os.environ.get("PORT", 10000))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 # ==========================================================
 # LOGGING
@@ -91,6 +92,34 @@ def pad_address_topic(addr: str) -> str:
 def update_activity(activity_type: str):
     last_activity["time"] = datetime.now()
     last_activity["type"] = activity_type
+
+# ==========================================================
+# SELF-PING KEEPER
+# ==========================================================
+class SelfPingKeeper:
+    """Keep-alive mechanism để giữ Render service hoạt động liên tục"""
+    def __init__(self, session: requests.Session):
+        self.session = session
+        self.url = RENDER_EXTERNAL_URL.rstrip('/') + '/ping' if RENDER_EXTERNAL_URL else None
+        self.ping_count = 0
+        self.fail_count = 0
+        
+    def ping_self(self):
+        """Ping chính service này để giữ nó hoạt động"""
+        if not self.url:
+            return
+            
+        try:
+            r = self.session.get(self.url, timeout=10)
+            if r.status_code == 200:
+                self.ping_count += 1
+                log.debug("🏓 Self-ping successful (#%d)", self.ping_count)
+            else:
+                self.fail_count += 1
+                log.warning("⚠️ Self-ping failed: %d", r.status_code)
+        except Exception as e:
+            self.fail_count += 1
+            log.debug("Self-ping error: %s", e)
 
 # ==========================================================
 # TELEGRAM
@@ -478,6 +507,29 @@ def ping():
     return {"pong": now_str()}
 
 # ==========================================================
+# SELF-PING THREAD
+# ==========================================================
+def run_self_pinger():
+    """Thread riêng để tự ping service, giữ cho Render không sleep"""
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'ROAM-SelfPing/1.0'})
+    keeper = SelfPingKeeper(session)
+    
+    if not RENDER_EXTERNAL_URL:
+        log.warning("⚠️ RENDER_EXTERNAL_URL not set, self-ping disabled")
+        return
+    
+    log.info("🏓 Self-ping keeper started (interval: %ds)", SELF_PING_INTERVAL_SEC)
+    
+    while not shutdown_event.is_set():
+        try:
+            keeper.ping_self()
+            time.sleep(SELF_PING_INTERVAL_SEC)
+        except Exception as e:
+            log.exception("❌ Self-ping keeper error: %s", e)
+            time.sleep(30)
+
+# ==========================================================
 # WATCHDOG THREAD
 # ==========================================================
 def run_watchdog():
@@ -558,7 +610,7 @@ def run_watchdog():
                         if tele.send_html(msg_bsc_transfer(t["direction"], amt, curr_bsc, t["tx"])):
                             last_bsc = curr_bsc
 
-                # Heartbeat (chỉ log, không gửi telegram)
+                # Heartbeat
                 if current_time - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                     uptime_hours = (datetime.now() - start_time).total_seconds() / 3600
                     sol_health = sol.get_health_status()
@@ -597,8 +649,14 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ==========================================================
 def main():
     log.info("=" * 60)
-    log.info("🚀 ROAM WATCHDOG v2.0")
+    log.info("🚀 ROAM WATCHDOG v2.1 (Continuous)")
     log.info("=" * 60)
+    
+    # Start self-ping keeper thread
+    if RENDER_EXTERNAL_URL:
+        pinger_thread = Thread(target=run_self_pinger, daemon=True, name="SelfPingerThread")
+        pinger_thread.start()
+        log.info("✅ Self-ping keeper started")
     
     # Start watchdog thread
     watchdog_thread = Thread(target=run_watchdog, daemon=True, name="WatchdogThread")
@@ -619,4 +677,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
