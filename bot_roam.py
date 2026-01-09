@@ -44,7 +44,23 @@ HEARTBEAT_INTERVAL_SEC = 300
 SELF_PING_INTERVAL_SEC = 240  # Ping mỗi 4 phút để giữ Render service active
 
 PORT = int(os.environ.get("PORT", 10000))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
+# Tự động detect URL từ Render
+def get_render_url():
+    """Tự động lấy URL của service từ Render environment"""
+    # Render tự động set RENDER_EXTERNAL_URL
+    if os.environ.get("RENDER_EXTERNAL_URL"):
+        return os.environ.get("RENDER_EXTERNAL_URL")
+    
+    # Hoặc build từ RENDER_SERVICE_NAME (Render tự động set)
+    service_name = os.environ.get("RENDER_SERVICE_NAME", "")
+    if service_name:
+        return f"https://{service_name}.onrender.com"
+    
+    # Fallback: hardcode URL của bạn
+    return "https://bot-roam.onrender.com"
+
+RENDER_EXTERNAL_URL = get_render_url()
 
 # ==========================================================
 # LOGGING
@@ -113,13 +129,13 @@ class SelfPingKeeper:
             r = self.session.get(self.url, timeout=10)
             if r.status_code == 200:
                 self.ping_count += 1
-                log.debug("🏓 Self-ping successful (#%d)", self.ping_count)
+                log.info("🏓 Self-ping OK (#%d)", self.ping_count)
             else:
                 self.fail_count += 1
                 log.warning("⚠️ Self-ping failed: %d", r.status_code)
         except Exception as e:
             self.fail_count += 1
-            log.debug("Self-ping error: %s", e)
+            log.warning("⚠️ Self-ping error: %s", e)
 
 # ==========================================================
 # TELEGRAM
@@ -516,10 +532,11 @@ def run_self_pinger():
     keeper = SelfPingKeeper(session)
     
     if not RENDER_EXTERNAL_URL:
-        log.warning("⚠️ RENDER_EXTERNAL_URL not set, self-ping disabled")
+        log.warning("⚠️ Cannot detect service URL, self-ping disabled")
         return
     
-    log.info("🏓 Self-ping keeper started (interval: %ds)", SELF_PING_INTERVAL_SEC)
+    log.info("🏓 Self-ping keeper started")
+    log.info("🌐 Target URL: %s", RENDER_EXTERNAL_URL)
     
     while not shutdown_event.is_set():
         try:
@@ -651,12 +668,12 @@ def main():
     log.info("=" * 60)
     log.info("🚀 ROAM WATCHDOG v2.1 (Continuous)")
     log.info("=" * 60)
+    log.info("🌐 Service URL: %s", RENDER_EXTERNAL_URL)
     
     # Start self-ping keeper thread
-    if RENDER_EXTERNAL_URL:
-        pinger_thread = Thread(target=run_self_pinger, daemon=True, name="SelfPingerThread")
-        pinger_thread.start()
-        log.info("✅ Self-ping keeper started")
+    pinger_thread = Thread(target=run_self_pinger, daemon=True, name="SelfPingerThread")
+    pinger_thread.start()
+    log.info("✅ Self-ping keeper started")
     
     # Start watchdog thread
     watchdog_thread = Thread(target=run_watchdog, daemon=True, name="WatchdogThread")
